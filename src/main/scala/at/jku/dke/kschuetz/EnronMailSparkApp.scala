@@ -34,43 +34,49 @@ object EnronMailSparkApp {
   }
 
   def writeAverageLengthAndRecipientsInInterval(paths: Array[String], from: LocalDate, to: LocalDate, targetPath: String): Unit = {
+    val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+                                               
     val emailDS = readParquetMails(paths).filter(mail => (mail.date.isEqual(from) || mail.date.isAfter(from)) && mail.date.isBefore(to))
-
+    // Convert dataset to new schema with required columns and register view
     val emailLengthDF = emailDS.map(mail => {
       (mail.id, mail.body.split(" ").length, mail.recipients.length)
     }).toDF("email_id", "email_length", "recipients_length")
     emailLengthDF.createOrReplaceTempView("email_view")
-
-    val queryResult = spark.sql("SELECT avg(email_length) as avgLength, avg(recipients_length) as avgNoOfRecipients, current_timestamp as timestamp FROM email_view")
-    queryResult.write.format("json").save(targetPath)
+    // Execute query to obtain averages
+    val queryResult = spark.sql("SELECT avg(email_length) as avgLength, avg(recipients_length) as avgNoOfRecipients FROM email_view")
+    // Construct bean and create dataset
+    val averageLengthBean = AverageLength(timestamp, queryResult.first().getAs[String]("avgLength"), queryResult.first().getAs[String]("avgNoOfRecipients"))
+    spark.createDataset[Email](Seq(averageLengthBean)).write.format("json").save(targetPath)
   }
 
   def writeAverageLengthAndRecipientsBySenderInInterval(paths: Array[String], from: LocalDate, to: LocalDate, targetPath: String): Unit = {
+    val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
     val emailDS = readParquetMails(paths).filter(mail => (mail.date.isEqual(from) || mail.date.isAfter(from)) && mail.date.isBefore(to))
-
+    // Convert dataset to schema with required columns
     val emailLengthDF = emailDS.map(mail => {
       (mail.id, mail.body.split(" ").length, mail.recipients.length, mail.from)
     }).toDF("email_id", "email_length", "recipients_length", "sender")
     emailLengthDF.createOrReplaceTempView("email_by_sender_view")
-
+    // Obtain averages for each sender
     val queryResult = spark.sql("SELECT avg(email_length) as avgLength, avg(recipients_length) as avgNoOfRecipients, current_timestamp as timestamp, sender as sender FROM email_by_sender_view GROUP BY sender")
+    // Map each row to bean
     val statisticEntryDS = queryResult.map(row =>
       StatisticEntry(row.getAs[String]("sender"), row.getAs[Double]("avgLength"), row.getAs[Double]("avgNoOfRecipients"))
     )
-    val currentTimestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-
-    val statistics = Statistics(currentTimestamp, statisticEntryDS.collect())
+   
+    // Construct result including timestamp and list of averages for each sender
+    val statistics = Statistics(timestamp, statisticEntryDS.collect())
     spark.createDataset[Statistics](Seq(statistics)).write.format("json").save(targetPath)
 
   }
 
   def loadEmails(path: String): Dataset[Email] = {
-    val emailRegex = "^([\\w-]+): (.*)$"
+    val emailRegex = "^([\\w-]+): (.*)$" // matches basically any string with a colon
     val emailPattern = Pattern.compile(emailRegex)
 
     val emails = spark.sparkContext
-      .wholeTextFiles(path, -1)
-      .flatMap { case (_, content) =>
+      .wholeTextFiles(path, -1) // RDD[Tuple<String,String>]
+      .flatMap { case (_, content) => // content -> file-content
         val lines = content.split("\n")
         var toList = List[String]()
         var id: Int = -1
@@ -82,10 +88,10 @@ object EnronMailSparkApp {
         for {
           line <- lines
         } yield {
-          val matcher = emailPattern.matcher(line)
+          val matcher = emailPattern.matcher(line) 
           if (matcher.find()) {
-            val key = matcher.group(1)
-            val value = matcher.group(2)
+            val key = matcher.group(1) // before colon
+            val value = matcher.group(2) // after colon
             key match {
               case "Message-ID" => id = value.hashCode
               case "Date" => date = LocalDateParserUtil.parseLocalDate(value)
@@ -100,7 +106,7 @@ object EnronMailSparkApp {
           }
         }
 
-        toList = toList.filter(s => s.trim.nonEmpty)
+        toList = toList.filter(s => s.trim.nonEmpty) // remove blank entries in recipients
         val email = Email(id, date, from, toList.toArray, subject, body)
         List(email).iterator
       }
@@ -118,6 +124,7 @@ case class Email(id: Int, date: LocalDate, from: String, recipients: Array[Strin
   require(date != null, "Date cannot be null")
 }
 
+case class AverageLength(timestamp: String, avgLength: Double, avgNoOfRecipients: Double)
 case class StatisticEntry(sender: String, avgNoOfRecipients: Double, avgLength: Double)
 case class Statistics(timestamp: String, statistics: Seq[StatisticEntry])
 
